@@ -15,7 +15,7 @@ from PIL import Image
 # Parse command-line arguments
 # -----------------------------
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Clean Cryo-ET Tilt Series with Dual-Direction Deep Learning Thresholding.")
+    parser = argparse.ArgumentParser(description="Clean Cryo-ET Tilt Series with Deep Learning.")
 
     parser.add_argument('--input_ts', type=str, required=True, help="Input .mrc tilt series")
     parser.add_argument('--cleaned_ts', type=str, required=True, help="Output cleaned .mrc tilt series")
@@ -26,8 +26,8 @@ def parse_arguments():
     parser.add_argument('--model', type=str, required=True, help="Path to model .pth file")
     parser.add_argument('--mdoc_input', type=str, help="Optional: Path to input .mdoc file")
     parser.add_argument('--mdoc_output', type=str, help="Optional: Path to output cleaned .mdoc file")
-    parser.add_argument('--confidence_threshold', type=float, default=0.5, help="Probability threshold to keep a tilt (0.0 to 1.0). Higher values exclude more tilts.")
-    parser.add_argument('--batch_size', type=int, default=1, help="Batch size for GPU inference acceleration")
+    parser.add_argument('--confidence_threshold', type=float, default=0.5, help="Corruption threshold above which a tilt is excluded (0.0 to 1.0). Lower values exclude more tilts.")
+    parser.add_argument('--batch_size', type=int, default=6, help="Batch size for GPU inference acceleration")
 
     return parser.parse_args()
 
@@ -138,17 +138,14 @@ for batch_idx in range(0, num_tilts, BATCH_SIZE):
     for local_idx, probabilities in enumerate(batch_probs):
         global_idx = batch_idx + local_idx
         
-        # Track probability of Class 1 (Good) vs Class 0 (Corrupted)
         prob_corrupted = probabilities[0]
         prob_good = probabilities[1]
 
-        # Dual direction thresholding condition check
-        if prob_good < CONFIDENCE_THRESHOLD:
-            # Exclude tilt (Its good probability falls below threshold requirements)
+        # Intuitive check: If the corruption probability meets or exceeds our limit, EXCLUDE it
+        if prob_corrupted >= CONFIDENCE_THRESHOLD:
             predicted_class = 0
             class_0_info.append((global_idx, prob_corrupted))
         else:
-            # Keep tilt (Meets or exceeds goodness target criteria)
             predicted_class = 1
             class_1_info.append((global_idx, prob_good))
 
@@ -182,12 +179,12 @@ with PdfPages(PDF_OUTPUT) as pdf:
         csv_data.append({
             "CurrentIndex": i,
             "ToBeRemoved": (predicted_class == 0),
-            "GoodProbability": np.round(probs[1], decimals=4),
             "CorruptProbability": np.round(probs[0], decimals=4),
+            "GoodProbability": np.round(probs[1], decimals=4),
             "Removed": False
         })
 
-    fig.text(0.5, 0.95, f"Tilt Angle Visualization (Threshold={CONFIDENCE_THRESHOLD})", ha='center', fontsize=14, weight='bold')
+    fig.text(0.5, 0.95, f"Tilt Angle Visualization (Corrupt Threshold={CONFIDENCE_THRESHOLD})", ha='center', fontsize=14, weight='bold')
     pdf.savefig()
     plt.close()
 
@@ -223,7 +220,7 @@ with PdfPages(PDF_OUTPUT) as pdf:
         for j in range(i + 1, len(axes)):
             fig.delaxes(axes[j])
 
-        fig.text(0.5, 0.92, "Excluded Tilt Images (Fell Below Goodness Threshold)", ha='center', fontsize=14, weight='bold')
+        fig.text(0.5, 0.92, "Excluded Tilt Images (Exceeded Corruption Threshold)", ha='center', fontsize=14, weight='bold')
         pdf.savefig()
         plt.close()
 

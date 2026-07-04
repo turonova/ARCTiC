@@ -88,9 +88,9 @@ python run_TS_cleaning.py \
    - **Example:** `2`
 
 5. `--confidence_threshold` `<float>` (Optional, default: `0.5`)
-   - **Description:** The probability threshold required to classify a tilt as "Good" and keep it. This threshold operates in two directions relative to the `0.5` baseline:
-      - **Higher thresholds (e.g., `0.75`)**: Demand a higher certainty of data quality to keep a tilt, resulting in more aggressive cleaning and more excluded tilts.
-      - **Lower thresholds (e.g., `0.25`)**: Lower the requirement for data quality survival, resulting in more lenient cleaning and fewer excluded tilts.
+   - **Description:** The maximum allowable corruption probability before a tilt is excluded. This allows for simple, dual-direction control over cleaning aggressiveness:
+      - **Higher thresholds (e.g., `0.8`)**: Very lenient. Slices are only thrown away if the model is at least 80% certain they are corrupted **(Excludes FEWER tilts)**.
+      - **Lower thresholds (e.g., `0.2`)**: Very strict. Slices with even a 20% chance of being corrupted are thrown away **(Excludes MORE tilts)**.
    - **Example:** `0.5`
 
 6. `--batch_size` `<int>` (Optional, default: `1`)
@@ -123,7 +123,7 @@ python run_TS_cleaning.py \
 1. Load the input tilt series data from `input_TS.mrc`.
 2. Pack frames into optimized inference batches of `16` to leverage high-performance GPU acceleration.
 3. Use the `swin_tiny_fine_tuned.pth` model to clean TS and visualize tilt angles.
-4. Apply a dual-direction threshold criteria filter of `0.5` (evaluating strictly whether an image meets or fails the target goodness parameter).
+4. Apply your custom Corruption Threshold criteria limit to split good tilts from distorted ones.
 5. Start tilt visualization at `-50` degrees with a step of `2` degrees.
 6. Generate and save the visualizations (tilt angle and classification probability scale bars) into `output_visualization.pdf`.
 7. Save the cleaned tilt series to `cleaned_TS.mrc`.
