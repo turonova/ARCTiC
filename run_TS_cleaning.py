@@ -15,7 +15,7 @@ from PIL import Image
 # Parse command-line arguments
 # -----------------------------
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Clean Cryo-ET Tilt Series with Deep Learning.")
+    parser = argparse.ArgumentParser(description="Clean Cryo-ET Tilt Series with Dual-Direction Deep Learning Thresholding.")
 
     parser.add_argument('--input_ts', type=str, required=True, help="Input .mrc tilt series")
     parser.add_argument('--cleaned_ts', type=str, required=True, help="Output cleaned .mrc tilt series")
@@ -26,7 +26,7 @@ def parse_arguments():
     parser.add_argument('--model', type=str, required=True, help="Path to model .pth file")
     parser.add_argument('--mdoc_input', type=str, help="Optional: Path to input .mdoc file")
     parser.add_argument('--mdoc_output', type=str, help="Optional: Path to output cleaned .mdoc file")
-    parser.add_argument('--confidence_threshold', type=float, default=0.0, help="Minimum probability required to use prediction (0.0 to 1.0)")
+    parser.add_argument('--confidence_threshold', type=float, default=0.5, help="Probability threshold to keep a tilt (0.0 to 1.0). Higher values exclude more tilts.")
     parser.add_argument('--batch_size', type=int, default=1, help="Batch size for GPU inference acceleration")
 
     return parser.parse_args()
@@ -54,10 +54,8 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # -----------------------------
 # Dynamic Class Detection & Model Selection
 # -----------------------------
-# Load state dict map safely to peek at final layer class dimensions
 state_dict = torch.load(MODEL, map_location="cpu")
 
-# Automatically determine number of classes by looking at the weights shape
 num_classes = 2  # Default fallback
 for key in state_dict.keys():
     if key in ['fc.weight', 'classifier.1.weight', 'head.fc.weight', 'head.weight']:
@@ -111,9 +109,8 @@ mrc = cryomap.read(INPUT_TS)
 num_tilts = mrc.shape[2]
 
 tomo3d = []
-class_0_info = []
-class_1_info = []
-class_null_info = []
+class_0_info = []  # Excluded tilts
+class_1_info = []  # Kept tilts
 csv_data = []
 
 # -----------------------------
@@ -123,9 +120,7 @@ print(f"Preprocessing and packing {num_tilts} tilts into batches (Size: {BATCH_S
 
 all_predicted_classes = []
 all_probabilities = []
-all_low_confidence_flags = []
 
-# Pre-stage and stack image data into memory arrays
 tensor_list = []
 for i in range(num_tilts):
     image_b16 = cryomap.scale(mrc[:, :, i], 0.0625)
@@ -133,7 +128,6 @@ for i in range(num_tilts):
     img_pil = Image.fromarray(image_b16).convert("RGB")
     tensor_list.append(image_transforms(img_pil))
 
-# Loop over batches
 for batch_idx in range(0, num_tilts, BATCH_SIZE):
     batch_tensors = torch.stack(tensor_list[batch_idx : batch_idx + BATCH_SIZE]).to(device)
     
@@ -143,25 +137,29 @@ for batch_idx in range(0, num_tilts, BATCH_SIZE):
 
     for local_idx, probabilities in enumerate(batch_probs):
         global_idx = batch_idx + local_idx
-        predicted_class = np.argmax(probabilities)
-        max_prob = np.max(probabilities)
-        is_low_confidence = max_prob < CONFIDENCE_THRESHOLD
+        
+        # Track probability of Class 1 (Good) vs Class 0 (Corrupted)
+        prob_corrupted = probabilities[0]
+        prob_good = probabilities[1]
+
+        # Dual direction thresholding condition check
+        if prob_good < CONFIDENCE_THRESHOLD:
+            # Exclude tilt (Its good probability falls below threshold requirements)
+            predicted_class = 0
+            class_0_info.append((global_idx, prob_corrupted))
+        else:
+            # Keep tilt (Meets or exceeds goodness target criteria)
+            predicted_class = 1
+            class_1_info.append((global_idx, prob_good))
 
         all_predicted_classes.append(predicted_class)
         all_probabilities.append(probabilities)
-        all_low_confidence_flags.append(is_low_confidence)
-
-        if is_low_confidence:
-            class_null_info.append((global_idx, max_prob))
-        elif predicted_class == 0:
-            class_0_info.append((global_idx, probabilities[0]))
-        else:
-            class_1_info.append((global_idx, probabilities[1]))
 
 # -----------------------------
 # PDF and Metadata Generation
 # -----------------------------
 with PdfPages(PDF_OUTPUT) as pdf:
+    # --- PAGE 1: Geometric Tilt Angle Plot ---
     fig = plt.figure(figsize=(5, 5))
     plt.axis('off')
 
@@ -171,37 +169,33 @@ with PdfPages(PDF_OUTPUT) as pdf:
         angle = ANGLE_START + i * ANGLE_STEP
         predicted_class = all_predicted_classes[i]
         probs = all_probabilities[i]
-        is_low_confidence = all_low_confidence_flags[i]
 
         angle_rad = np.radians(angle)
         
-        if predicted_class == 1 or is_low_confidence:
+        if predicted_class == 1:
             tomo3d.append(mrc[:, :, i])
-            color = 'orange' if is_low_confidence else 'black'
-            plt.plot([-np.cos(angle_rad), np.cos(angle_rad)], [-np.sin(angle_rad), np.sin(angle_rad)], color=color)
-            if is_low_confidence:
-                plt.text(np.cos(angle_rad) * 1.01, np.sin(angle_rad) * 1.09, f"{i}?", fontsize=5, color='orange')
+            plt.plot([-np.cos(angle_rad), np.cos(angle_rad)], [-np.sin(angle_rad), np.sin(angle_rad)], color='black')
         else:
             plt.plot([-np.cos(angle_rad), np.cos(angle_rad)], [-np.sin(angle_rad), np.sin(angle_rad)], color='red', linestyle='--')
             plt.text(np.cos(angle_rad) * 1.01, np.sin(angle_rad) * 1.09, str(i), fontsize=5, color='red')
 
         csv_data.append({
             "CurrentIndex": i,
-            "ToBeRemoved": (predicted_class == 0) and (not is_low_confidence),
-            "Confident": not is_low_confidence,
-            "MaxProbability": np.round(np.max(probs), decimals=4),
+            "ToBeRemoved": (predicted_class == 0),
+            "GoodProbability": np.round(probs[1], decimals=4),
+            "CorruptProbability": np.round(probs[0], decimals=4),
             "Removed": False
         })
 
-    fig.text(0.5, 0.95, "Tilt Angle Visualization (Orange=Uncertain)", ha='center', fontsize=14, weight='bold')
+    fig.text(0.5, 0.95, f"Tilt Angle Visualization (Threshold={CONFIDENCE_THRESHOLD})", ha='center', fontsize=14, weight='bold')
     pdf.savefig()
     plt.close()
 
-    # Safe check: Plot probability bars only if there are frames flagged for exclusion
-    num_images = len(class_0_info)
-    if num_images > 0:
+    # --- PAGE 2: Excluded Tilts Overview ---
+    num_excluded = len(class_0_info)
+    if num_excluded > 0:
         cols = 3
-        rows = (num_images // cols) + (num_images % cols > 0)
+        rows = (num_excluded // cols) + (num_excluded % cols > 0)
         fig, axes = plt.subplots(rows, cols, figsize=(10, rows * 3))
         axes = np.atleast_1d(axes).flatten()
         fig.subplots_adjust(top=0.8, hspace=0.5, wspace=0.5)
@@ -224,13 +218,12 @@ with PdfPages(PDF_OUTPUT) as pdf:
             )
             cbar.set_ticks([0, 0.5, 1])
             cbar.set_ticklabels(['0%', '50%', '100%'])
-
-            ax.set_title(f"Index: {index} | Prob: {prob:.2%}")
+            ax.set_title(f"Index: {index} | Corrupt Prob: {prob:.2%}")
 
         for j in range(i + 1, len(axes)):
             fig.delaxes(axes[j])
 
-        fig.text(0.5, 0.9, "Excluded Tilt Images with Probability Scale Bar", ha='center', fontsize=14, weight='bold')
+        fig.text(0.5, 0.92, "Excluded Tilt Images (Fell Below Goodness Threshold)", ha='center', fontsize=14, weight='bold')
         pdf.savefig()
         plt.close()
 
