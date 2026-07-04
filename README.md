@@ -62,6 +62,7 @@ python run_TS_cleaning.py \
   --angle_start -50 \
   --angle_step 2 \
   --confidence_threshold 0.8 \
+  --batch_size 16 \
   --pdf_output 'output_visualization.pdf' \
   --model 'models/swin_tiny_fine-tuned.pth' \
   --csv_output 'classification_results.csv' \
@@ -90,23 +91,27 @@ python run_TS_cleaning.py \
    - **Description:** The minimum classification probability required to accept a prediction. If the model's prediction confidence is below this threshold, the tilt is flagged as uncertain. For data safety, **uncertain tilts are kept by default** in the final `.mrc` volume, flagged in orange within the visualizer, and marked as unconfident in the CSV logs.
    - **Example:** `0.8`
 
-6. `--pdf_output` `<path to output PDF file>` (Optional, default: 'output_visualization.pdf')
+6. `--batch_size` `<int>` (Optional, default: 1)
+   - **Description:** The number of tilt images stacked and passed to the GPU simultaneously during evaluation. Increasing this accelerates processing significantly depending on your available VRAM.
+   - **Example:** `16`
+
+7. `--pdf_output` `<path to output PDF file>` (Optional, default: 'output_visualization.pdf')
    - **Description:** Path to the PDF file where the visualizations (tilt angles and excluded images with probability bars) will be saved.
    - **Example:** `'output_visualization.pdf'`
 
-7. `--model` `<path to model file>` (Required)
+8. `--model` `<path to model file>` (Required)
    - **Description:** Path to the pre-trained model file (e.g., a Swin transformer model) that will be used for classifying images. The model should be compatible with the network architecture specified in the script.
    - **Example:** `'models/swin_tiny_fine-tuned.pth'`
 
-8. `--csv_output` `<path to output CSV file>` (Optional)
+9. `--csv_output` `<path to output CSV file>` (Optional)
    - **Description:** Path where the classification results CSV file will be saved. This CSV lists each slice with flags indicating if it should be removed. Providing this option enables export of slice classification results.
    - **Example:** `'classification_results.csv'`
 
-9. `--mdoc_input` `<path to input .mdoc file>` (Optional)
+10. `--mdoc_input` `<path to input .mdoc file>` (Optional)
    - **Description:** Path to the .mdoc metadata file associated with the tilt series. Used for removing metadata entries corresponding to corrupted tilts (as determined by the model).
    - **Example:** `'input_series.mdoc'`
 
-10. `--mdoc_output` `<path to output .mdoc file>` (Optional)
+11. `--mdoc_output` `<path to output .mdoc file>` (Optional)
    - **Description:** Output path for saving the cleaned .mdoc file. **Must be used together with --mdoc_input and --csv_output.**
    - **Example:** `'cleaned_series.mdoc'`
 
@@ -114,13 +119,14 @@ python run_TS_cleaning.py \
 ### This command will:
 
 1. Load the input tilt series data from `input_TS.mrc`.
-2. Use the `swin_tiny_fine_tuned.pth` model to clean TS and visualize tilt angles.
-3. Apply a confidence safety net threshold of `0.8` (keeping borderline/uncertain predictions intact).
-4. Start tilt visualization at `-50` degrees with a step of `2` degrees.
-5. Generate and save the visualizations (tilt angle and classification probability scale bars) into `output_visualization.pdf`.
-6. Save the cleaned tilt series to `cleaned_TS.mrc`.
-7. Export classification results (indices and probabilities) to a CSV file `classification_results.csv`.
-8. If a corresponding `input_series.mdoc` file is provided, generate a cleaned version `cleaned_series.mdoc` by removing entries of excluded tilts.
+2. Pack frames into optimized inference batches of `16` to leverage high-performance GPU acceleration.
+3. Use the `swin_tiny_fine_tuned.pth` model to clean TS and visualize tilt angles.
+4. Apply a confidence safety net threshold of `0.8` (keeping borderline/uncertain predictions intact).
+5. Start tilt visualization at `-50` degrees with a step of `2` degrees.
+6. Generate and save the visualizations (tilt angle and classification probability scale bars) into `output_visualization.pdf`.
+7. Save the cleaned tilt series to `cleaned_TS.mrc`.
+8. Export classification results (indices and probabilities) to a CSV file `classification_results.csv`.
+9. If a corresponding `input_series.mdoc` file is provided, generate a cleaned version `cleaned_series.mdoc` by removing entries of excluded tilts.
 
 
 ## Additional Notes

@@ -27,6 +27,7 @@ def parse_arguments():
     parser.add_argument('--mdoc_input', type=str, help="Optional: Path to input .mdoc file")
     parser.add_argument('--mdoc_output', type=str, help="Optional: Path to output cleaned .mdoc file")
     parser.add_argument('--confidence_threshold', type=float, default=0.0, help="Minimum probability required to use prediction (0.0 to 1.0)")
+    parser.add_argument('--batch_size', type=int, default=1, help="Batch size for GPU inference acceleration")
 
     return parser.parse_args()
 
@@ -43,6 +44,7 @@ PDF_OUTPUT = args.pdf_output
 CSV_OUTPUT = args.csv_output
 MODEL = args.model
 CONFIDENCE_THRESHOLD = args.confidence_threshold
+BATCH_SIZE = args.batch_size
 
 # -----------------------------
 # Setup device (GPU if available)
@@ -91,37 +93,11 @@ image_transforms = transforms.Compose([
 ])
 
 # -----------------------------
-# Evaluation function
-# -----------------------------
-def evaluate_single_image(image_input, index, class_0_info, class_1_info, class_null_info):
-    if isinstance(image_input, str):
-        image = Image.open(image_input).convert("RGB")
-    else:
-        image = image_input
-
-    image = image_transforms(image).unsqueeze(0).to(device)
-
-    with torch.no_grad():
-        output = model(image)
-        probabilities = torch.softmax(output, dim=1).cpu().numpy()[0]
-
-    predicted_class = np.argmax(probabilities)
-    max_prob = np.max(probabilities)
-    is_low_confidence = max_prob < CONFIDENCE_THRESHOLD
-
-    if is_low_confidence:
-        class_null_info.append((index, max_prob))
-    elif predicted_class == 0:
-        class_0_info.append((index, probabilities[0]))
-    else:
-        class_1_info.append((index, probabilities[1]))
-
-    return predicted_class, probabilities, is_low_confidence
-
-# -----------------------------
 # Load tilt series
 # -----------------------------
 mrc = cryomap.read(INPUT_TS)
+num_tilts = mrc.shape[2]
+
 tomo3d = []
 class_0_info = []
 class_1_info = []
@@ -129,35 +105,75 @@ class_null_info = []
 csv_data = []
 
 # -----------------------------
-# PDF output setup
+# Accelerated Batched Inference Pipeline
+# -----------------------------
+print(f"Preprocessing and packing {num_tilts} tilts into batches (Size: {BATCH_SIZE})...")
+
+all_predicted_classes = []
+all_probabilities = []
+all_low_confidence_flags = []
+
+# 1. Pre-stage and stack image data into memory arrays
+pil_images = []
+tensor_list = []
+
+for i in range(num_tilts):
+    image_b16 = cryomap.scale(mrc[:, :, i], 0.0625)
+    image_b16 = ((image_b16 - image_b16.min()) * (255.0 / (image_b16.max() - image_b16.min()))).astype('uint8')
+    img_pil = Image.fromarray(image_b16).convert("RGB")
+    pil_images.append(img_pil)
+    tensor_list.append(image_transforms(img_pil))
+
+# 2. Loop over batches and pass chunks directly to the GPU
+for batch_idx in range(0, num_tilts, BATCH_SIZE):
+    batch_tensors = torch.stack(tensor_list[batch_idx : batch_idx + BATCH_SIZE]).to(device)
+    
+    with torch.no_grad():
+        output = model(batch_tensors)
+        batch_probs = torch.softmax(output, dim=1).cpu().numpy()
+
+    for local_idx, probabilities in enumerate(batch_probs):
+        global_idx = batch_idx + local_idx
+        predicted_class = np.argmax(probabilities)
+        max_prob = np.max(probabilities)
+        is_low_confidence = max_prob < CONFIDENCE_THRESHOLD
+
+        all_predicted_classes.append(predicted_class)
+        all_probabilities.append(probabilities)
+        all_low_confidence_flags.append(is_low_confidence)
+
+        # Distribute into specific evaluation lists
+        if is_low_confidence:
+            class_null_info.append((global_idx, max_prob))
+        elif predicted_class == 0:
+            class_0_info.append((global_idx, probabilities[0]))
+        else:
+            class_1_info.append((global_idx, probabilities[1]))
+
+# -----------------------------
+# PDF and Metadata Generation
 # -----------------------------
 with PdfPages(PDF_OUTPUT) as pdf:
     fig = plt.figure(figsize=(5, 5))
     plt.axis('off')
 
-    print("Processing tilt series...")
+    print("Generating validation visualizations...")
 
-    for i in range(mrc.shape[2]):
+    for i in range(num_tilts):
         angle = ANGLE_START + i * ANGLE_STEP
-        image_b16 = cryomap.scale(mrc[:, :, i], 0.0625)
-        image_b16 = ((image_b16 - image_b16.min()) * (255.0 / (image_b16.max() - image_b16.min()))).astype('uint8')
-        image_b16 = Image.fromarray(image_b16).convert("RGB")
-
-        predicted_class, probs, is_low_confidence = evaluate_single_image(image_b16, i, class_0_info, class_1_info, class_null_info)
+        predicted_class = all_predicted_classes[i]
+        probs = all_probabilities[i]
+        is_low_confidence = all_low_confidence_flags[i]
 
         angle_rad = np.radians(angle)
         
-        # Logic: Keep if the model explicitly says keep (1) OR if it is low confidence
         if predicted_class == 1 or is_low_confidence:
             tomo3d.append(mrc[:, :, i])
-            
-            # Use orange for low confidence tilts so they stand out in the visualization
             color = 'orange' if is_low_confidence else 'black'
             plt.plot([-np.cos(angle_rad), np.cos(angle_rad)], [-np.sin(angle_rad), np.sin(angle_rad)], color=color)
             if is_low_confidence:
                 plt.text(np.cos(angle_rad) * 1.01, np.sin(angle_rad) * 1.09, f"{i}?", fontsize=5, color='orange')
         else:
-            # Drop only if confidently identified as class 0
             plt.plot([-np.cos(angle_rad), np.cos(angle_rad)], [-np.sin(angle_rad), np.sin(angle_rad)], color='red', linestyle='--')
             plt.text(np.cos(angle_rad) * 1.01, np.sin(angle_rad) * 1.09, str(i), fontsize=5, color='red')
 
@@ -183,6 +199,7 @@ with PdfPages(PDF_OUTPUT) as pdf:
         fig.subplots_adjust(top=0.8, hspace=0.5, wspace=0.5)
 
         for i, (index, prob) in enumerate(class_0_info):
+            # Read pre-calculated scale visualizations
             image_b16 = cryomap.scale(mrc[:, :, index], 0.0625)
             image_b16 = ((image_b16 - image_b16.min()) * (255.0 / (image_b16.max() - image_b16.min()))).astype('uint8')
             image_b16 = Image.fromarray(image_b16)
