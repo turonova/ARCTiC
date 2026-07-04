@@ -184,7 +184,7 @@ with PdfPages(PDF_OUTPUT) as pdf:
             "Removed": False
         })
 
-    fig.text(0.5, 0.95, f"Tilt Angle Visualization (Corrupt Threshold={CONFIDENCE_THRESHOLD})", ha='center', fontsize=14, weight='bold')
+    fig.text(0.5, 0.95, f"Tilt Angle Visualization", ha='center', fontsize=12, weight='bold')
     pdf.savefig()
     plt.close()
 
@@ -215,12 +215,12 @@ with PdfPages(PDF_OUTPUT) as pdf:
             )
             cbar.set_ticks([0, 0.5, 1])
             cbar.set_ticklabels(['0%', '50%', '100%'])
-            ax.set_title(f"Index: {index} | Corrupt Prob: {prob:.2%}")
+            ax.set_title(f"Index: {index} | Prob: {prob:.2%}")
 
         for j in range(i + 1, len(axes)):
             fig.delaxes(axes[j])
 
-        fig.text(0.5, 0.92, "Excluded Tilt Images (Exceeded Corruption Threshold)", ha='center', fontsize=14, weight='bold')
+        fig.text(0.5, 0.92, "Excluded Tilt Images", ha='center', fontsize=12, weight='bold')
         pdf.savefig()
         plt.close()
 
