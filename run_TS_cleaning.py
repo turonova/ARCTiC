@@ -52,23 +52,35 @@ BATCH_SIZE = args.batch_size
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # -----------------------------
-# Model selection and loading
+# Dynamic Class Detection & Model Selection
 # -----------------------------
-def modify_resnet():
+# Load state dict map safely to peek at final layer class dimensions
+state_dict = torch.load(MODEL, map_location="cpu")
+
+# Automatically determine number of classes by looking at the weights shape
+num_classes = 2  # Default fallback
+for key in state_dict.keys():
+    if key in ['fc.weight', 'classifier.1.weight', 'head.fc.weight', 'head.weight']:
+        num_classes = state_dict[key].shape[0]
+        break
+
+print(f"Detected model configuration: {num_classes} classes.")
+
+def modify_resnet(num_classes):
     model = models.resnet50(pretrained=False)
-    model.fc = nn.Linear(model.fc.in_features, 2)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
 
-def modify_efficientnet():
+def modify_efficientnet(num_classes):
     model = models.efficientnet_b3(pretrained=False)
-    model.classifier[1] = nn.Linear(model.classifier[1].in_features, 2)
+    model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
     return model
 
 model_mapping = {
-    'swin_tiny': lambda: timm.create_model('swin_tiny_patch4_window7_224', pretrained=False, num_classes=2),
-    'swin_large': lambda: timm.create_model('swin_large_patch4_window7_224', pretrained=False, num_classes=2),
-    'resnet': lambda: modify_resnet(),
-    'efficientnet': lambda: modify_efficientnet(),
+    'swin_tiny': lambda: timm.create_model('swin_tiny_patch4_window7_224', pretrained=False, num_classes=num_classes),
+    'swin_large': lambda: timm.create_model('swin_large_patch4_window7_224', pretrained=False, num_classes=num_classes),
+    'resnet': lambda: modify_resnet(num_classes),
+    'efficientnet': lambda: modify_efficientnet(num_classes),
 }
 
 for key in model_mapping:
@@ -78,7 +90,7 @@ for key in model_mapping:
 else:
     raise ValueError("MODEL must contain 'swin_tiny', 'swin_large', 'resnet', or 'efficientnet'")
 
-model.load_state_dict(torch.load(MODEL, map_location=device))
+model.load_state_dict(state_dict)
 model = model.to(device)
 model.eval()
 print("Model loaded successfully.")
@@ -113,18 +125,15 @@ all_predicted_classes = []
 all_probabilities = []
 all_low_confidence_flags = []
 
-# 1. Pre-stage and stack image data into memory arrays
-pil_images = []
+# Pre-stage and stack image data into memory arrays
 tensor_list = []
-
 for i in range(num_tilts):
     image_b16 = cryomap.scale(mrc[:, :, i], 0.0625)
     image_b16 = ((image_b16 - image_b16.min()) * (255.0 / (image_b16.max() - image_b16.min()))).astype('uint8')
     img_pil = Image.fromarray(image_b16).convert("RGB")
-    pil_images.append(img_pil)
     tensor_list.append(image_transforms(img_pil))
 
-# 2. Loop over batches and pass chunks directly to the GPU
+# Loop over batches
 for batch_idx in range(0, num_tilts, BATCH_SIZE):
     batch_tensors = torch.stack(tensor_list[batch_idx : batch_idx + BATCH_SIZE]).to(device)
     
@@ -142,7 +151,6 @@ for batch_idx in range(0, num_tilts, BATCH_SIZE):
         all_probabilities.append(probabilities)
         all_low_confidence_flags.append(is_low_confidence)
 
-        # Distribute into specific evaluation lists
         if is_low_confidence:
             class_null_info.append((global_idx, max_prob))
         elif predicted_class == 0:
@@ -189,7 +197,7 @@ with PdfPages(PDF_OUTPUT) as pdf:
     pdf.savefig()
     plt.close()
 
-    # Plot probability bars for class 0 (Confident Removals)
+    # Safe check: Plot probability bars only if there are frames flagged for exclusion
     num_images = len(class_0_info)
     if num_images > 0:
         cols = 3
@@ -199,7 +207,6 @@ with PdfPages(PDF_OUTPUT) as pdf:
         fig.subplots_adjust(top=0.8, hspace=0.5, wspace=0.5)
 
         for i, (index, prob) in enumerate(class_0_info):
-            # Read pre-calculated scale visualizations
             image_b16 = cryomap.scale(mrc[:, :, index], 0.0625)
             image_b16 = ((image_b16 - image_b16.min()) * (255.0 / (image_b16.max() - image_b16.min()))).astype('uint8')
             image_b16 = Image.fromarray(image_b16)
