@@ -10,7 +10,6 @@ from matplotlib.backends.backend_pdf import PdfPages
 from torchvision import transforms, models
 from cryocat import cryomap, mdoc
 from PIL import Image
-import os
 
 # -----------------------------
 # Parse command-line arguments
@@ -27,6 +26,7 @@ def parse_arguments():
     parser.add_argument('--model', type=str, required=True, help="Path to model .pth file")
     parser.add_argument('--mdoc_input', type=str, help="Optional: Path to input .mdoc file")
     parser.add_argument('--mdoc_output', type=str, help="Optional: Path to output cleaned .mdoc file")
+    parser.add_argument('--confidence_threshold', type=float, default=0.0, help="Minimum probability required to use prediction (0.0 to 1.0)")
 
     return parser.parse_args()
 
@@ -42,6 +42,7 @@ ANGLE_STEP = args.angle_step
 PDF_OUTPUT = args.pdf_output
 CSV_OUTPUT = args.csv_output
 MODEL = args.model
+CONFIDENCE_THRESHOLD = args.confidence_threshold
 
 # -----------------------------
 # Setup device (GPU if available)
@@ -92,7 +93,7 @@ image_transforms = transforms.Compose([
 # -----------------------------
 # Evaluation function
 # -----------------------------
-def evaluate_single_image(image_input, index, class_0_info, class_1_info):
+def evaluate_single_image(image_input, index, class_0_info, class_1_info, class_null_info):
     if isinstance(image_input, str):
         image = Image.open(image_input).convert("RGB")
     else:
@@ -105,13 +106,17 @@ def evaluate_single_image(image_input, index, class_0_info, class_1_info):
         probabilities = torch.softmax(output, dim=1).cpu().numpy()[0]
 
     predicted_class = np.argmax(probabilities)
+    max_prob = np.max(probabilities)
+    is_low_confidence = max_prob < CONFIDENCE_THRESHOLD
 
-    if predicted_class == 0:
+    if is_low_confidence:
+        class_null_info.append((index, max_prob))
+    elif predicted_class == 0:
         class_0_info.append((index, probabilities[0]))
     else:
         class_1_info.append((index, probabilities[1]))
 
-    return predicted_class, probabilities
+    return predicted_class, probabilities, is_low_confidence
 
 # -----------------------------
 # Load tilt series
@@ -120,6 +125,7 @@ mrc = cryomap.read(INPUT_TS)
 tomo3d = []
 class_0_info = []
 class_1_info = []
+class_null_info = []
 csv_data = []
 
 # -----------------------------
@@ -137,61 +143,72 @@ with PdfPages(PDF_OUTPUT) as pdf:
         image_b16 = ((image_b16 - image_b16.min()) * (255.0 / (image_b16.max() - image_b16.min()))).astype('uint8')
         image_b16 = Image.fromarray(image_b16).convert("RGB")
 
-        predicted_class, probs = evaluate_single_image(image_b16, i, class_0_info, class_1_info)
+        predicted_class, probs, is_low_confidence = evaluate_single_image(image_b16, i, class_0_info, class_1_info, class_null_info)
 
         angle_rad = np.radians(angle)
-        if predicted_class:
+        
+        # Logic: Keep if the model explicitly says keep (1) OR if it is low confidence
+        if predicted_class == 1 or is_low_confidence:
             tomo3d.append(mrc[:, :, i])
-            plt.plot([-np.cos(angle_rad), np.cos(angle_rad)], [-np.sin(angle_rad), np.sin(angle_rad)], color='black')
+            
+            # Use orange for low confidence tilts so they stand out in the visualization
+            color = 'orange' if is_low_confidence else 'black'
+            plt.plot([-np.cos(angle_rad), np.cos(angle_rad)], [-np.sin(angle_rad), np.sin(angle_rad)], color=color)
+            if is_low_confidence:
+                plt.text(np.cos(angle_rad) * 1.01, np.sin(angle_rad) * 1.09, f"{i}?", fontsize=5, color='orange')
         else:
+            # Drop only if confidently identified as class 0
             plt.plot([-np.cos(angle_rad), np.cos(angle_rad)], [-np.sin(angle_rad), np.sin(angle_rad)], color='red', linestyle='--')
             plt.text(np.cos(angle_rad) * 1.01, np.sin(angle_rad) * 1.09, str(i), fontsize=5, color='red')
 
         csv_data.append({
             "CurrentIndex": i,
-            "ToBeRemoved": predicted_class == 0,
+            "ToBeRemoved": (predicted_class == 0) and (not is_low_confidence),
+            "Confident": not is_low_confidence,
+            "MaxProbability": np.round(np.max(probs), decimals=4),
             "Removed": False
         })
 
-    fig.text(0.5, 0.95, "Tilt Angle Visualization", ha='center', fontsize=14, weight='bold')
+    fig.text(0.5, 0.95, "Tilt Angle Visualization (Orange=Uncertain)", ha='center', fontsize=14, weight='bold')
     pdf.savefig()
     plt.close()
 
-    # Plot probability bars for class 0
+    # Plot probability bars for class 0 (Confident Removals)
     num_images = len(class_0_info)
-    cols = 3
-    rows = (num_images // cols) + (num_images % cols > 0)
-    fig, axes = plt.subplots(rows, cols, figsize=(10, rows * 3))
-    axes = axes.flatten()
-    fig.subplots_adjust(top=0.8, hspace=0.5, wspace=0.5)
+    if num_images > 0:
+        cols = 3
+        rows = (num_images // cols) + (num_images % cols > 0)
+        fig, axes = plt.subplots(rows, cols, figsize=(10, rows * 3))
+        axes = np.atleast_1d(axes).flatten()
+        fig.subplots_adjust(top=0.8, hspace=0.5, wspace=0.5)
 
-    for i, (index, prob) in enumerate(class_0_info):
-        image_b16 = cryomap.scale(mrc[:, :, index], 0.0625)
-        image_b16 = ((image_b16 - image_b16.min()) * (255.0 / (image_b16.max() - image_b16.min()))).astype('uint8')
-        image_b16 = Image.fromarray(image_b16)
+        for i, (index, prob) in enumerate(class_0_info):
+            image_b16 = cryomap.scale(mrc[:, :, index], 0.0625)
+            image_b16 = ((image_b16 - image_b16.min()) * (255.0 / (image_b16.max() - image_b16.min()))).astype('uint8')
+            image_b16 = Image.fromarray(image_b16)
 
-        ax = axes[i]
-        ax.imshow(image_b16, cmap='gray')
-        ax.axis('off')
+            ax = axes[i]
+            ax.imshow(image_b16, cmap='gray')
+            ax.axis('off')
 
-        colors = ['red'] * int(prob * 100) + ['black'] * (100 - int(prob * 100))
-        discrete_cmap = ListedColormap(colors)
+            colors = ['red'] * int(prob * 100) + ['black'] * (100 - int(prob * 100))
+            discrete_cmap = ListedColormap(colors)
 
-        cbar = fig.colorbar(
-            plt.cm.ScalarMappable(cmap=discrete_cmap, norm=plt.Normalize(vmin=0, vmax=1)),
-            ax=ax, orientation='vertical', fraction=0.046, pad=0.04
-        )
-        cbar.set_ticks([0, 0.5, 1])
-        cbar.set_ticklabels(['0%', '50%', '100%'])
+            cbar = fig.colorbar(
+                plt.cm.ScalarMappable(cmap=discrete_cmap, norm=plt.Normalize(vmin=0, vmax=1)),
+                ax=ax, orientation='vertical', fraction=0.046, pad=0.04
+            )
+            cbar.set_ticks([0, 0.5, 1])
+            cbar.set_ticklabels(['0%', '50%', '100%'])
 
-        ax.set_title(f"Index: {index} | Prob: {prob:.2%}")
+            ax.set_title(f"Index: {index} | Prob: {prob:.2%}")
 
-    for j in range(i + 1, len(axes)):
-        fig.delaxes(axes[j])
+        for j in range(i + 1, len(axes)):
+            fig.delaxes(axes[j])
 
-    fig.text(0.5, 0.9, "Excluded Tilt Images with Probability Scale Bar", ha='center', fontsize=14, weight='bold')
-    pdf.savefig()
-    plt.close()
+        fig.text(0.5, 0.9, "Excluded Tilt Images with Probability Scale Bar", ha='center', fontsize=14, weight='bold')
+        pdf.savefig()
+        plt.close()
 
 # -----------------------------
 # Save cleaned .mrc volume
